@@ -156,3 +156,10 @@ Conventions for contributors and AI agents are in [`AGENTS.md`](AGENTS.md).
 - [`DESIGN.md`](DESIGN.md): the direction (universal app runtime used like a browser) and the roadmap
 - [`RESEARCH.md`](RESEARCH.md): prior art, whether it's worth it, Windows options, security findings
 - [`AGENTS.md`](AGENTS.md): codebase map and conventions
+
+## License
+
+[GNU Affero General Public License v3.0](LICENSE) (`AGPL-3.0-only`).
+
+You can use, modify and share DockBrowser freely. If you distribute it, or let people use a modified version over a
+network, you must make your source code available under the same license.
