@@ -1,0 +1,6 @@
+{
+  "identifier": "default",
+  "description": "Shell webview only. Tab webviews are children of the same window and load remote content, so scope by webview, never by window.",
+  "webviews": ["main"],
+  "permissions": ["core:default"]
+}

@@ -1,0 +1,240 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>DockBrowser</title>
+<style>
+  :root { color-scheme: light dark; font: 13px system-ui, sans-serif; --line: #8884; --soft: #8882; }
+  * { box-sizing: border-box; }
+  body { margin: 0; height: 100vh; display: flex; flex-direction: column; }
+  /* Exactly engine::TOOLBAR_HEIGHT (84px) tall: tab webviews are placed right below it. */
+  #toolbar { height: 84px; flex: none; display: grid; grid-template-rows: 38px 46px; border-bottom: 1px solid var(--line); }
+  #tabs { display: flex; gap: 4px; padding: 6px 8px 0; overflow-x: auto; }
+  .tab { display: flex; align-items: center; gap: 4px; max-width: 220px; padding: 0 4px 0 10px; border: 1px solid var(--line); border-bottom: 0; border-radius: 8px 8px 0 0; cursor: default; }
+  .tab[aria-selected=true] { background: var(--soft); }
+  .tab .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  button { font: inherit; color: inherit; background: none; border: 0; border-radius: 6px; padding: 4px 8px; }
+  button:hover:not(:disabled) { background: var(--soft); }
+  #bar { display: flex; gap: 4px; align-items: center; padding: 0 8px; }
+  #address { flex: 1; min-width: 0; padding: 6px 10px; border: 1px solid var(--line); border-radius: 6px; font: inherit; }
+  select { font: inherit; padding: 4px; }
+  label.check { display: flex; gap: 4px; align-items: center; white-space: nowrap; }
+  #status { color: #d33; max-width: 30%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  main { flex: 1; overflow: auto; padding: 24px; }
+  h2 { font-size: 13px; margin: 20px 0 8px; opacity: .7; }
+  .tiles { display: flex; flex-wrap: wrap; gap: 8px; }
+  .tiles button { border: 1px solid var(--line); padding: 10px 14px; max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tiles:empty::after { content: "Nothing yet"; opacity: .5; }
+  form#custom { display: grid; gap: 8px; max-width: 520px; margin-top: 8px; }
+  form#custom label { display: grid; gap: 2px; font-size: 12px; }
+  form#custom input { font: inherit; padding: 6px 8px; }
+  .row { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
+</style>
+</head>
+<body>
+<header id="toolbar">
+  <nav id="tabs" role="tablist"></nav>
+  <form id="bar">
+    <button type="button" id="back" aria-label="Back">◀</button>
+    <button type="button" id="forward" aria-label="Forward">▶</button>
+    <button type="button" id="reload" aria-label="Reload">⟳</button>
+    <input id="address" placeholder="Search a site (example.com) or open an app (app:fedora)" autocomplete="off" spellcheck="false">
+    <button type="button" id="pin" aria-label="Pin">☆</button>
+    <select id="engine" aria-label="Engine"></select>
+    <label class="check" title="Always use this engine for this site"><input type="checkbox" id="remember" disabled> Always</label>
+    <span id="status" role="alert"></span>
+  </form>
+</header>
+<main>
+  <section id="start">
+    <h2>Apps</h2><div id="apps" class="tiles"></div>
+    <h2>Pinned</h2><div id="pins" class="tiles"></div>
+    <h2>Recent</h2><div id="recents" class="tiles"></div>
+    <details>
+      <summary><h2 style="display:inline">Custom container</h2></summary>
+      <form id="custom">
+        <label>Image or Dockerfile directory <input name="image" required placeholder="nginxinc/nginx-unprivileged or /path/to/app"></label>
+        <div class="row">
+          <label>Port <input name="port" type="number" min="1" max="65535" required placeholder="8080"></label>
+          <label>CPUs <input name="cpus" value="1"></label>
+          <label>Memory <input name="memory" value="512m"></label>
+        </div>
+        <button style="justify-self:start;border:1px solid var(--line)">Open</button>
+      </form>
+    </details>
+  </section>
+  <section id="loading" hidden><p>Starting <b></b>…</p><p>The first open of an app builds its image and can take a few minutes.</p></section>
+  <section id="external" hidden><p>This tab runs in an external <b></b> window.</p></section>
+</main>
+<script>
+const { invoke } = window.__TAURI__.core;
+const { listen } = window.__TAURI__.event;
+const $ = id => document.getElementById(id);
+const address = $('address'), engineSel = $('engine'), remember = $('remember');
+
+const tabs = new Map(); // id -> TabInfo; pending opens use string ids
+let active = null, newTabEngine = 'auto', pending = 0;
+
+// Pins and recents are per-device conveniences: localStorage, and the page works without it.
+const store = {
+  get(k) { try { return JSON.parse(localStorage.getItem(k)) || []; } catch { return []; } },
+  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
+};
+
+const status = e => { $('status').textContent = e ? String(e) : ''; $('status').title = e ? String(e) : ''; };
+const current = () => { const t = tabs.get(active); return t && !t.pending ? t : null; };
+const inWindow = t => t && t.engine === 'webkit';
+
+invoke('catalog').then(c => {
+  const label = { container: 'container (Firefox)' };
+  engineSel.replaceChildren(...['auto', ...c.engines].map(e => new Option(label[e] || e, e)));
+  renderTiles('apps', c.apps.map(a => ({ label: `app:${a}`, req: { url: `app:${a}`, engine: 'auto' } })));
+});
+
+function renderTiles(id, entries) {
+  $(id).replaceChildren(...entries.map(({ label, req }) => {
+    const b = document.createElement('button');
+    b.textContent = label; b.title = label;
+    b.onclick = () => open(req);
+    return b;
+  }));
+}
+
+function renderStart() {
+  renderTiles('pins', store.get('pins'));
+  renderTiles('recents', store.get('recents'));
+}
+
+function renderTabs() {
+  const items = [...tabs.values()].map(t => {
+    const el = document.createElement('div');
+    el.className = 'tab'; el.setAttribute('role', 'tab'); el.setAttribute('aria-selected', t.id === active);
+    const name = document.createElement('span');
+    name.className = 'name';
+    name.textContent = (t.pending ? '⏳ ' : t.container ? '⧉ ' : '') + (t.title || t.address);
+    name.title = t.address;
+    el.append(name);
+    if (!t.pending) {
+      const x = document.createElement('button');
+      x.textContent = '×'; x.setAttribute('aria-label', 'Close tab');
+      x.onclick = e => { e.stopPropagation(); close(t.id); };
+      el.append(x);
+    }
+    el.onclick = () => select(t.id);
+    return el;
+  });
+  const plus = document.createElement('button');
+  plus.textContent = '+'; plus.setAttribute('aria-label', 'New tab');
+  plus.onclick = () => { select(null); address.focus(); };
+  $('tabs').replaceChildren(...items, plus);
+}
+
+function select(id) {
+  active = id;
+  const t = tabs.get(id), ready = current();
+  invoke('select_tab', { id: ready ? ready.id : null }).catch(status);
+  $('start').hidden = !!t;
+  $('loading').hidden = !t?.pending;
+  $('loading').querySelector('b').textContent = t?.title || '';
+  $('external').hidden = !(ready && !inWindow(ready));
+  $('external').querySelector('b').textContent = ready?.engine || '';
+  address.value = t ? t.address : '';
+  // on a web tab the engine picker switches that tab; elsewhere it picks the engine for the next open
+  engineSel.value = ready && !ready.container ? ready.engine : newTabEngine;
+  remember.disabled = engineSel.value === 'auto';
+  for (const b of ['back', 'forward', 'reload']) $(b).disabled = !inWindow(ready);
+  $('pin').disabled = !ready;
+  $('pin').textContent = ready && store.get('pins').some(p => p.label === ready.address) ? '★' : '☆';
+  if (!t) renderStart();
+  renderTabs();
+}
+
+async function open(req) {
+  status();
+  const key = `p${++pending}`;
+  const label = req.image || req.url;
+  tabs.set(key, { id: key, pending: true, title: label, address: label });
+  select(key);
+  try {
+    const info = await invoke('open_tab', { req });
+    tabs.delete(key);
+    tabs.set(info.id, info);
+    store.set('recents', [{ label: info.address, req }, ...store.get('recents').filter(r => r.label !== info.address)].slice(0, 12));
+    active === key ? select(info.id) : renderTabs();
+  } catch (e) {
+    tabs.delete(key);
+    active === key ? select(null) : renderTabs();
+    status(e);
+  }
+}
+
+function close(id) {
+  invoke('close_tab', { id }).catch(status);
+  removeTab(id);
+}
+
+function removeTab(id) {
+  const ids = [...tabs.keys()], i = ids.indexOf(id);
+  if (i < 0) return;
+  tabs.delete(id);
+  active === id ? select(ids[i + 1] ?? ids[i - 1] ?? null) : renderTabs();
+}
+
+$('bar').onsubmit = e => {
+  e.preventDefault();
+  const url = address.value.trim(), t = current();
+  if (!url) return;
+  status();
+  if (inWindow(t) && !t.container && !url.startsWith('app:')) {
+    invoke('navigate', { id: t.id, url }).catch(status);
+  } else {
+    open({ url, engine: engineSel.value, remember: remember.checked });
+  }
+};
+
+engineSel.onchange = () => {
+  const t = current();
+  remember.disabled = engineSel.value === 'auto';
+  if (!t || t.container) { newTabEngine = engineSel.value; return; }
+  const chosen = engineSel.value;
+  engineSel.value = t.engine;
+  if (chosen === 'container') return open({ url: t.address, engine: 'container' });
+  if (chosen === 'auto') return;
+  invoke('switch_engine', { id: t.id, engine: chosen })
+    .then(info => { tabs.set(info.id, info); select(info.id); })
+    .catch(status);
+};
+
+for (const action of ['back', 'forward', 'reload']) {
+  $(action).onclick = () => { const t = current(); if (t) invoke('history', { id: t.id, action }).catch(status); };
+}
+
+$('pin').onclick = () => {
+  const t = current();
+  if (!t) return;
+  const pins = store.get('pins');
+  const req = t.container ? (store.get('recents').find(r => r.label === t.address)?.req || { url: t.address, engine: 'auto' }) : { url: t.address, engine: t.engine };
+  store.set('pins', pins.some(p => p.label === t.address) ? pins.filter(p => p.label !== t.address) : [...pins, { label: t.address, req }]);
+  select(active);
+};
+
+$('custom').onsubmit = e => {
+  e.preventDefault();
+  const f = Object.fromEntries(new FormData(e.target));
+  open({ url: '', engine: 'auto', image: f.image, port: Number(f.port), cpus: f.cpus, memory: f.memory });
+};
+
+listen('tab-closed', e => removeTab(e.payload));
+listen('tab-url', e => {
+  const [id, url] = e.payload, t = tabs.get(id);
+  if (!t || t.container) return;
+  t.address = url;
+  try { t.title = new URL(url).host || url; } catch { t.title = url; }
+  if (id === active && document.activeElement !== address) address.value = url;
+  renderTabs();
+});
+
+select(null);
+</script>
+</body>
+</html>
